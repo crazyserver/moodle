@@ -8,6 +8,7 @@ Feature: Manage notification preferences - Email
     Given the following "users" exist:
       | username | firstname | lastname | email                |
       | student1 | Student   | 1        | student1@example.com |
+      | student2 | Student   | 2        | student2@example.com |
     And the following config values are set as admin:
       | messaging | 1 |
 
@@ -101,12 +102,14 @@ Feature: Manage notification preferences - Email
     And the following "course enrolments" exist:
       | user | course | role |
       | student1 | C1 | student |
+      | student2 | C1 | student |
     And the following config values are set as admin:
       | popup_provider_mod_assign_assign_notification_locked    | 0     | message |
       | message_provider_mod_assign_assign_notification_enabled | popup | message |
     And the following "user preferences" exist:
       | user      | preference                                                | value |
       | student1  | message_provider_mod_assign_assign_notification_enabled   | none  |
+      | student2  | message_provider_mod_assign_assign_notification_enabled   | popup  |
     And the following "activity" exists:
       | activity                            | assign               |
       | course                              | C1                   |
@@ -118,6 +121,7 @@ Feature: Manage notification preferences - Email
     And the following "mod_assign > submissions" exist:
       | assign                | user      | onlinetext                   |
       | Test assignment name  | student1  | I'm the student1 submission  |
+      | Test assignment name  | student2  | I'm the student2 submission  |
     When I log in as "student1"
     # Confirm the popover is not showing any unread notifications.
     Then I should not see "1" in the "#nav-notification-popover-container [data-region='count-container']" "css_element"
@@ -125,6 +129,13 @@ Feature: Manage notification preferences - Email
     And I open the notification popover
     # Confirm the submission notification is NOT visible.
     And I should not see "You have submitted your assignment submission for Test assignment name" in the "#nav-notification-popover-container" "css_element"
+    And I log in as "student2"
+    # Confirm the popover is showing the unread notifications.
+    Then I should see "1" in the "#nav-notification-popover-container [data-region='count-container']" "css_element"
+    # Open the popover.
+    And I open the notification popover
+    # Confirm the submission notification is visible.
+    And I should see "You have submitted your assignment submission for Test assignment name" in the "#nav-notification-popover-container" "css_element"
 
   Scenario: User cannot disable forced notification preferences
     Given the following "courses" exist:
