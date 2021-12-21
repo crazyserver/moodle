@@ -3641,11 +3641,12 @@ privatefiles,moodle|/user/files.php';
         // Migrate user preferences. ie merging message_provider_moodle_instantmessage_loggedoff with
         // message_provider_moodle_instantmessage_loggedin to message_provider_moodle_instantmessage_enabled.
 
-        $allrecordsparams = array('loggedin' => 'message_provider_%_loggedin', 'loggedoff' => 'message_provider_%_loggedoff');
-        $allrecordsloggedin = $DB->sql_like('name', ':loggedin');
         $allrecordsloggedoff = $DB->sql_like('name', ':loggedoff');
-        $allrecordsloggedinoffsql = "$allrecordsloggedin OR $allrecordsloggedoff";
-        $total = $DB->count_records_select('user_preferences', $allrecordsloggedinoffsql, $allrecordsparams);
+        $total = $DB->count_records_select(
+            'user_preferences',
+            $allrecordsloggedoff,
+            array('loggedoff' => 'message_provider_%_loggedoff')
+        );
         $i = 0;
 
         // Show a progress bar.
@@ -3659,81 +3660,116 @@ privatefiles,moodle|/user/files.php';
             upgrade_set_timeout(3600);
             $componentproviderbase = 'message_provider_'.$provider->component.'_'.$provider->name;
 
-            $newname = $componentproviderbase.'_enabled';
+            $loggedinname = $componentproviderbase.'_loggedin';
+            $loggedoffname = $componentproviderbase.'_loggedoff';
+
+            // Change loggedin to enabled.
+            $enabledname = $componentproviderbase.'_enabled';
+            $DB->set_field('user_preferences', 'name', $enabledname, array('name' => $loggedinname));
 
             $selectparams = array(
-                'loggedin1' => $componentproviderbase.'_loggedin',
-                'loggedoff1' => $componentproviderbase.'_loggedoff',
-                'loggedin2' => $componentproviderbase.'_loggedin',
-                'loggedoff2' => $componentproviderbase.'_loggedoff',
+                'enabled' => $enabledname,
+                'loggedoff' => $loggedoffname,
             );
+            $sql = 'SELECT m1.id loggedoffid, m1.value as loggedoff, m2.value as enabled, m2.id as enabledid
+                FROM
+                    (SELECT id, userid, value FROM {user_preferences} WHERE name = :loggedoff) AS m1
+                LEFT JOIN
+                    (SELECT id, userid, value FROM {user_preferences} WHERE name = :enabled) AS m2
+                    ON m1.userid = m2.userid';
 
-            // Simulate a FULL OUTER JOIN
-            $sql = 'SELECT m1.userid u1, m2.userid u2, m1.value as loggedin, m2.value as loggedoff
-                    FROM
-                        (SELECT userid, value FROM {user_preferences} WHERE name = :loggedin1) AS m1
-                    LEFT JOIN
-                        (SELECT userid, value FROM {user_preferences} WHERE name = :loggedoff1) AS m2
-                        ON m1.userid = m2.userid
-                UNION
-                    SELECT m1.userid u1, m2.userid u2, m1.value as loggedin, m2.value as loggedoff
-                    FROM
-                        (SELECT userid, value FROM {user_preferences} WHERE name = :loggedin2) AS m1
-                    RIGHT JOIN
-                        (SELECT userid, value FROM {user_preferences} WHERE name = :loggedoff2) AS m2
-                        ON m1.userid = m2.userid';
-
-            // Migrate in chunks of 1000.
-            $newrecords = [];
             while (($rs = $DB->get_recordset_sql($sql, $selectparams, 0, 1000)) && $rs->valid()) {
                 // 10 minutes for every chunk.
                 upgrade_set_timeout(600);
 
+                $deleterecords = [];
+                $changename = [];
+                $changevalue = []; // Multidimensional array with possible values as key to reduce SQL queries.
                 foreach ($rs as $record) {
-                    $newrecord = new StdClass();
-                    $newrecord->name = $newname;
-                    $newrecord->userid = $record->u1 ? $record->u1 : $record->u2;
+                    if (empty($record->enabledid)) {
+                        // Enabled does not exists, change the name.
+                        $changename[] = $record->loggedoffid;
+                    } else if ($record->enabledid != $record->loggedoff) {
+                        // Exist and different values (check on SQL), update the enabled record.
+                        $enabledvalues = $record->enabled != 'none' && !empty($record->enabled)
+                            ? explode(',', $record->enabled)
+                            : [];
+                        $loggedoffvalues = !empty($record->loggedoff) && $record->loggedoff != 'none' && !empty($record->loggedoff)
+                            ? explode(',', $record->loggedoff)
+                            : [];
+                        $values = array_unique(array_merge($enabledvalues, $loggedoffvalues));
+                        sort($values);
 
-                    if ($record->loggedin == $record->loggedoff) {
-                        // They are the same, take one.
-                        $newrecord->value = $record->loggedin;
-                        $i += 2;
+                        $newvalue = empty($values) ? 'none' : implode(',', $values);
+                        if (!isset($changevalue[$newvalue])) {
+                            $changevalue[$newvalue] = [];
+                        }
+                        $changevalue[$newvalue][] = $record->enabledid;
+
+                        $deleterecords[] = $record->loggedoffid;
                     } else {
-                        $loggedinvalues = !empty($record->loggedin) && $record->loggedin != 'none' ? explode(',', $record->loggedin) : [];
-                        $loggedoffvalues = !empty($record->loggedoff) && $record->loggedoff != 'none' ? explode(',', $record->loggedoff) : [];
-                        $values = array_unique(array_merge($loggedinvalues, $loggedoffvalues));
-                        $newrecord->value = empty($values) ? 'none' : implode(',', $values);
-                        $i += empty($record->loggedin) || empty($record->loggedoff) ? 1 : 2;
+                        // They are the same, just delete loggedoff one.
+                        $deleterecords[] = $record->loggedoffid;
                     }
-                    $newrecords[$newrecord->userid] = $newrecord;
+                    $i++;
                 }
                 $rs->close();
 
-                if (!empty($newrecords)) {
-                    $transaction = $DB->start_delegated_transaction();
-                    $DB->insert_records('user_preferences', $newrecords);
-                    $deleteparams = array(
-                        'loggedin' => $componentproviderbase.'_loggedin',
-                        'loggedoff' => $componentproviderbase.'_loggedoff',
+                // Commit the changes.
+                if (!empty($changename)) {
+                    $changenameparams = array(
+                        'name' => $loggedoffname,
                     );
-                    $loggedinoffsql = '(name = :loggedin OR name = :loggedoff) AND userid IN (' . implode(',', array_keys($newrecords)) . ')';
+                    $changenameselect = 'name = :name AND id IN (' . implode(',', $changename) . ')';
+                    $DB->set_field_select('user_preferences', 'name', $enabledname, $changenameselect, $changenameparams);
+                }
 
-                    $DB->delete_records_select('user_preferences', $loggedinoffsql, $deleteparams);
-                    $transaction->allow_commit();
+                if (!empty($changevalue)) {
+                    $changevalueparams = array(
+                        'name' => $enabledname,
+                    );
+                    foreach ($changevalue as $value => $ids) {
+                        $changevalueselect = 'name = :name AND id IN (' . implode(',', $ids) . ')';
+                        $DB->set_field_select('user_preferences', 'value', $value, $changevalueselect, $changevalueparams);
+                    }
+                }
+
+                if (!empty($deleterecords)) {
+                    $deleteparams = array(
+                        'name' => $loggedoffname,
+                    );
+                    $deleteselect = 'name = :name AND id IN (' . implode(',', $deleterecords) . ')';
+                    $DB->delete_records_select('user_preferences', $deleteselect, $deleteparams);
                 }
 
                 // Update progress.
                 $pbar->update($i, $total, "Upgrading user notifications preferences - $i/$total.");
 
-                // Reset chunk.
-                $newrecords = [];
+                // Reset arrays.
+                $deleterecords = [];
+                $changename = [];
+                $changevalue = [];
             }
             $rs->close();
+
+            // Delete the rest of loggedoff values (that are equal than enabled).
+            $deleteparams = array(
+                'name' => $loggedoffname,
+            );
+            $deleteselect = 'name = :name';
+            $i += $DB->count_records_select('user_preferences', $deleteselect, $deleteparams);
+            $DB->delete_records_select('user_preferences', $deleteselect, $deleteparams);
+
+            // Update progress.
+            $pbar->update($i, $total, "Upgrading user notifications preferences - $i/$total.");
         }
 
         core_plugin_manager::reset_caches();
 
         // Delete the orphan records.
+        $allrecordsparams = array('loggedin' => 'message_provider_%_loggedin', 'loggedoff' => 'message_provider_%_loggedoff');
+        $allrecordsloggedin = $DB->sql_like('name', ':loggedin');
+        $allrecordsloggedinoffsql = "$allrecordsloggedin OR $allrecordsloggedoff";
         $DB->delete_records_select('user_preferences', $allrecordsloggedinoffsql, $allrecordsparams);
 
         // Update progress.
