@@ -3641,54 +3641,103 @@ privatefiles,moodle|/user/files.php';
         // Migrate user preferences. ie merging message_provider_moodle_instantmessage_loggedoff with
         // message_provider_moodle_instantmessage_loggedin to message_provider_moodle_instantmessage_enabled.
 
+        $allrecordsparams = array('loggedin' => 'message_provider_%_loggedin', 'loggedoff' => 'message_provider_%_loggedoff');
+        $allrecordsloggedin = $DB->sql_like('name', ':loggedin');
+        $allrecordsloggedoff = $DB->sql_like('name', ':loggedoff');
+        $allrecordsloggedinoffsql = "$allrecordsloggedin OR $allrecordsloggedoff";
+        $total = $DB->count_records_select('user_preferences', $allrecordsloggedinoffsql, $allrecordsparams);
+        $i = 0;
+
+        // Show a progress bar.
+        $pbar = new progress_bar('upgradeusernotificationpreferences', 500, true);
+        $pbar->update($i, $total, "Upgrading user notifications preferences - $i/$total.");
+
         // We're migrating provider per provider to reduce memory usage.
         $providers = $DB->get_records('message_providers', null, 'name');
-        $loggedinoffsql = 'name = :loggedin OR name = :loggedoff';
         foreach ($providers as $provider) {
+            // 60 minutes to migrate each provider.
+            upgrade_set_timeout(3600);
             $componentproviderbase = 'message_provider_'.$provider->component.'_'.$provider->name;
 
-            $params = array('loggedin' => $componentproviderbase.'_loggedin', 'loggedoff' => $componentproviderbase.'_loggedoff');
-            $rs = $DB->get_recordset_select('user_preferences', $loggedinoffsql, $params, 'userid', 'id,userid,name,value');
-
             $newname = $componentproviderbase.'_enabled';
-            // Create a list of the records to create. (Mixed key: "userid_name").
+
+            $selectparams = array(
+                'loggedin1' => $componentproviderbase.'_loggedin',
+                'loggedoff1' => $componentproviderbase.'_loggedoff',
+                'loggedin2' => $componentproviderbase.'_loggedin',
+                'loggedoff2' => $componentproviderbase.'_loggedoff',
+            );
+
+            // Simulate a FULL OUTER JOIN
+            $sql = 'SELECT m1.userid u1, m2.userid u2, m1.value as loggedin, m2.value as loggedoff
+                    FROM
+                        (SELECT userid, value FROM {user_preferences} WHERE name = :loggedin1) AS m1
+                    LEFT JOIN
+                        (SELECT userid, value FROM {user_preferences} WHERE name = :loggedoff1) AS m2
+                        ON m1.userid = m2.userid
+                UNION
+                    SELECT m1.userid u1, m2.userid u2, m1.value as loggedin, m2.value as loggedoff
+                    FROM
+                        (SELECT userid, value FROM {user_preferences} WHERE name = :loggedin2) AS m1
+                    RIGHT JOIN
+                        (SELECT userid, value FROM {user_preferences} WHERE name = :loggedoff2) AS m2
+                        ON m1.userid = m2.userid';
+
+            // Migrate in chunks of 1000.
             $newrecords = [];
-            foreach ($rs as $record) {
-                // Save unique values (they can be defined in loggedin and loggedoff).
-                if (isset($newrecords[$user->id])) {
-                    $values = [];
+            while (($rs = $DB->get_recordset_sql($sql, $selectparams, 0, 1000)) && $rs->valid()) {
+                // 10 minutes for every chunk.
+                upgrade_set_timeout(600);
 
-                    if (!empty($newrecords[$user->id]->value) && $newrecords[$user->id]->value != 'none') {
-                        $values = explode(',', $newrecords[$user->id]->value);
+                foreach ($rs as $record) {
+                    $newrecord = new StdClass();
+                    $newrecord->name = $newname;
+                    $newrecord->userid = $record->u1 ? $record->u1 : $record->u2;
+
+                    if ($record->loggedin == $record->loggedoff) {
+                        // They are the same, take one.
+                        $newrecord->value = $record->loggedin;
+                        $i += 2;
+                    } else {
+                        $loggedinvalues = !empty($record->loggedin) && $record->loggedin != 'none' ? explode(',', $record->loggedin) : [];
+                        $loggedoffvalues = !empty($record->loggedoff) && $record->loggedoff != 'none' ? explode(',', $record->loggedoff) : [];
+                        $values = array_unique(array_merge($loggedinvalues, $loggedoffvalues));
+                        $newrecord->value = empty($values) ? 'none' : implode(',', $values);
+                        $i += empty($record->loggedin) || empty($record->loggedoff) ? 1 : 2;
                     }
-
-                    if (!empty($record->value) && $record->value != 'none') {
-                        $values = array_merge(explode(',', $record->value), $values);
-                    }
-
-                    $values = array_unique($values);
-
-                    $newrecords[$user->id]->value = empty($values) ? 'none' : implode(',', $values);
-                } else {
-                    $record->name = $newname;
-                    $newrecords[$user->id] = $record;
+                    $newrecords[$newrecord->userid] = $newrecord;
                 }
+                $rs->close();
+
+                if (!empty($newrecords)) {
+                    $transaction = $DB->start_delegated_transaction();
+                    $DB->insert_records('user_preferences', $newrecords);
+                    $deleteparams = array(
+                        'loggedin' => $componentproviderbase.'_loggedin',
+                        'loggedoff' => $componentproviderbase.'_loggedoff',
+                    );
+                    $loggedinoffsql = '(name = :loggedin OR name = :loggedoff) AND userid IN (' . implode(',', array_keys($newrecords)) . ')';
+
+                    $DB->delete_records_select('user_preferences', $loggedinoffsql, $deleteparams);
+                    $transaction->allow_commit();
+                }
+
+                // Update progress.
+                $pbar->update($i, $total, "Upgrading user notifications preferences - $i/$total.");
+
+                // Reset chunk.
+                $newrecords = [];
             }
             $rs->close();
-
-            // Insert the records.
-            $DB->insert_records('user_preferences', $newrecords);
-
-            // Delete the old records.
-            $DB->delete_records_select('user_preferences', $loggedinoffsql, $params);
         }
 
+        core_plugin_manager::reset_caches();
+
         // Delete the orphan records.
-        $params = array('loggedin' => 'message_provider_%_loggedin', 'loggedoff' => 'message_provider_%_loggedoff');
-        $loggedin = $DB->sql_like('name', ':loggedin');
-        $loggedoff = $DB->sql_like('name', ':loggedoff');
-        $loggedinoffsql = "$loggedin OR $loggedoff";
-        $DB->delete_records_select('user_preferences', $loggedinoffsql, $params);
+        $DB->delete_records_select('user_preferences', $allrecordsloggedinoffsql, $allrecordsparams);
+
+        // Update progress.
+        $pbar->update($total, $total, "Upgrading user notifications preferences - $total/$total.");
 
         upgrade_main_savepoint(true, 2022011700.00);
     }
