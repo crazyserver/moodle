@@ -3538,5 +3538,160 @@ privatefiles,moodle|/user/files.php';
         upgrade_main_savepoint(true, 2021123000.03);
     }
 
+
+    if ($oldversion < 2022011700.00) {
+        // Migrate default message output config.
+        $preferences = get_config('message');
+
+        $treatedprefs = [];
+
+        foreach ($preferences as $preference => $value) {
+            // Extract provider and preference name from the setting name.
+            // Example name: airnotifier_provider_enrol_imsenterprise_imsenterprise_enrolment_permitted
+            // Provider: airnotifier
+            // Preference: enrol_imsenterprise_imsenterprise_enrolment_permitted.
+            $providerparts = explode('_provider_', $preference);
+            if (count($providerparts) <= 1) {
+                continue;
+            }
+
+            $provider = $providerparts[0];
+            $preference = $providerparts[1];
+
+            // Extract and remove last part of the preference previously extracted: ie. permitted.
+            $parts = explode('_', $preference);
+            $key = array_pop($parts);
+
+            if (in_array($key, array('permitted', 'loggedin', 'loggedoff'))) {
+                if ($key == 'permitted') {
+                    // We will use provider name instead of permitted.
+                    $key = $provider;
+                } else {
+                    // Logged in and logged off values are a csv of the enabled providers.
+                    $value = explode(',', $value);
+                }
+
+                // Join the rest of the parts: ie enrol_imsenterprise_imsenterprise_enrolment.
+                $prefname = implode('_', $parts);
+
+                if (!isset($treatedprefs[$prefname])) {
+                    $treatedprefs[$prefname] = [];
+                }
+
+                // Save the value with the selected key.
+                $treatedprefs[$prefname][$key] = $value;
+            }
+        }
+
+        // Now take every preference previous treated and its values.
+        foreach ($treatedprefs as $prefname => $values) {
+            $enabled = []; // List of providers enabled for each preference.
+
+            // Enable if one of those is enabled.
+            $loggedin = isset($values['loggedin']) ? $values['loggedin'] : [];
+            foreach ($loggedin as $provider) {
+                $enabled[$provider] = 1;
+            }
+            $loggedoff = isset($values['loggedoff']) ? $values['loggedoff'] : [];
+            foreach ($loggedoff as $provider) {
+                $enabled[$provider] = 1;
+            }
+
+            // Do not treat those values again.
+            unset($values['loggedin']);
+            unset($values['loggedoff']);
+
+            // Translate rest of values coming from permitted "key".
+            foreach ($values as $provider => $value) {
+                switch ($value) {
+                    case 'forced':
+                        // Provider is enabled by force.
+                        $enabled[$provider] = 1;
+                        $locked = true;
+                        break;
+                    case 'disallowed':
+                        // Provider is disabled by force.
+                        unset($enabled[$provider]);
+                        $locked = true;
+                        break;
+                    case 'permitted':
+                        // Provider is not forced.
+                        $locked = false;
+                        break;
+                    default:
+                        // Invalid value.
+                }
+
+                // Save locked.
+                if ($locked) {
+                    set_config($provider.'_provider_'.$prefname.'_locked', 1, 'message');
+                }
+                // Remove old value.
+                unset_config($provider.'_provider_'.$prefname.'_permitted', 'message');
+            }
+
+            // Save the new values.
+            $value = implode(',', array_keys($enabled));
+            set_config('message_provider_'.$prefname.'_enabled', $value, 'message');
+            // Remove old values.
+            unset_config('message_provider_'.$prefname.'_loggedin', 'message');
+            unset_config('message_provider_'.$prefname.'_loggedoff', 'message');
+        }
+
+        // Migrate user preferences. ie merging message_provider_moodle_instantmessage_loggedoff with
+        // message_provider_moodle_instantmessage_loggedin to message_provider_moodle_instantmessage_enabled.
+
+        // We're migrating provider per provider to reduce memory usage.
+        $providers = $DB->get_records('message_providers', null, 'name');
+        $loggedinoffsql = 'name = :loggedin OR name = :loggedoff';
+        foreach ($providers as $provider) {
+            $componentproviderbase = 'message_provider_'.$provider->component.'_'.$provider->name;
+
+            $params = array('loggedin' => $componentproviderbase.'_loggedin', 'loggedoff' => $componentproviderbase.'_loggedoff');
+            $rs = $DB->get_recordset_select('user_preferences', $loggedinoffsql, $params, 'userid', 'id,userid,name,value');
+
+            $newname = $componentproviderbase.'_enabled';
+            // Create a list of the records to create. (Mixed key: "userid_name").
+            $newrecords = [];
+            foreach ($rs as $record) {
+                // Save unique values (they can be defined in loggedin and loggedoff).
+                if (isset($newrecords[$user->id])) {
+                    $values = [];
+
+                    if (!empty($newrecords[$user->id]->value) && $newrecords[$user->id]->value != 'none') {
+                        $values = explode(',', $newrecords[$user->id]->value);
+                    }
+
+                    if (!empty($record->value) && $record->value != 'none') {
+                        $values = array_merge(explode(',', $record->value), $values);
+                    }
+
+                    $values = array_unique($values);
+
+                    $newrecords[$user->id]->value = empty($values) ? 'none' : implode(',', $values);
+                } else {
+                    $record->name = $newname;
+                    $newrecords[$user->id] = $record;
+                }
+            }
+            $rs->close();
+
+            // Insert the records.
+            $DB->insert_records('user_preferences', $newrecords);
+
+            // Delete the old records.
+            $DB->delete_records_select('user_preferences', $loggedinoffsql, $params);
+        }
+
+        // Delete the orphan records.
+        $params = array('loggedin' => 'message_provider_%_loggedin', 'loggedoff' => 'message_provider_%_loggedoff');
+        $loggedin = $DB->sql_like('name', ':loggedin');
+        $loggedoff = $DB->sql_like('name', ':loggedoff');
+        $loggedinoffsql = "$loggedin OR $loggedoff";
+        $DB->delete_records_select('user_preferences', $loggedinoffsql, $params);
+
+        upgrade_main_savepoint(true, 2022011700.00);
+    }
+
     return true;
 }
