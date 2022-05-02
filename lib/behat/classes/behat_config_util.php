@@ -653,7 +653,7 @@ class behat_config_util {
             // If the mobile app is enabled, check its version and add appropriate tags.
             if ($mobiletags = $this->get_mobile_version_tags()) {
                 if (!empty($values['tags'])) {
-                    $values['tags'] .= ' && ' . $mobiletags;
+                    $values['tags'] .= '&&' . $mobiletags;
                 } else {
                     $values['tags'] = $mobiletags;
                 }
@@ -757,15 +757,61 @@ class behat_config_util {
             return '';
         }
 
-        // Read all feature files to check which mobile tags are used. (Note: This could be cached
+        $tags = $this->get_version_exception_tags($installedversion, 'app');
+
+        if ($verbose) {
+            mtrace('Configured app tests for version ' . $installedversion);
+        }
+
+        if (empty($tags)) {
+            return '';
+        }
+
+        return '~'.join('&&~', $tags);
+    }
+
+    /**
+     * Gets LMS version exclusion tags to avoid executing LMS out of version tags.
+     *
+     * @return array List of exclussion tags.
+     */
+    protected function get_blacklisted_lms_version_tags() : array {
+        global $CFG;
+
+        $version = trim($CFG->release);
+        $versionarr = explode(" ", $version);
+        if (!empty($versionarr)) {
+            $version = $versionarr[0];
+        }
+
+        // Replace everything but numbers and dots by dots.
+        $version = preg_replace('/[^\.\d]/', '.', $version);
+        // Combine multiple dots in one.
+        $version = preg_replace('/(\.{2,})/', '.', $version);
+        // Trim possible leading and trailing dots.
+        $installedversion = trim($version, '.');
+
+        return $this->get_version_exception_tags($installedversion, 'lms');
+    }
+
+    /**
+     * Gets version exception tags to avoid running versions that do not match the purpose.
+     *
+     * @param string $detectecversion Detected version.
+     * @param string $prefix Tag prefix name.
+     * @return array List of excluding tags.
+     */
+    protected function get_version_exception_tags(string $detectecversion, string $prefix) : array {
+
+        // Read all feature files to check which version tags are used. (Note: This could be cached
         // but ideally, it is the sort of thing that really ought to be refreshed by doing a new
-        // Behat init. Also, at time of coding it only takes 0.3 seconds and only if app enabled.)
+        // Behat init. Also, at time of coding it only takes 0.3 seconds.).
         $usedtags = [];
         foreach ($this->features as $filepath) {
             $feature = file_get_contents($filepath);
             // This may incorrectly detect versions used e.g. in a comment or something, but it
             // doesn't do much harm if we have extra ones.
-            if (preg_match_all('~@app_(?:from|upto)(?:[0-9]+(?:\.[0-9]+)*)~', $feature, $matches)) {
+            if (preg_match_all('~@'.$prefix.'_(?:from|upto)(?:[0-9]+(?:\.[0-9]+)*)~', $feature, $matches)) {
                 foreach ($matches[0] as $tag) {
                     // Store as key in array so we don't get duplicates.
                     $usedtags[$tag] = true;
@@ -773,21 +819,33 @@ class behat_config_util {
             }
         }
 
+        $detectedversion_count = substr_count($detectecversion, '.');
+
         // Set up relevant tags for each version.
         $tags = [];
         foreach ($usedtags as $usedtag => $ignored) {
-            if (!preg_match('~^@app_(from|upto)([0-9]+(?:\.[0-9]+)*)$~', $usedtag, $matches)) {
+            if (!preg_match('~^@'.$prefix.'_(from|upto)([0-9]+(?:\.[0-9]+)*)$~', $usedtag, $matches)) {
                 throw new coding_exception('Unexpected tag format');
             }
             $direction = $matches[1];
             $version = $matches[2];
 
-            switch (version_compare($installedversion, $version)) {
+            $version_count = substr_count($version, '.');
+
+            // Compare versions on same length.
+            $detected = $detectecversion;
+            if ($version_count < $detectedversion_count) {
+                $detected_parts = explode('.', $detectecversion);
+                array_splice($detected_parts, $version_count - $detectedversion_count);
+                $detected = implode('.', $detected_parts);
+            }
+
+            switch (version_compare($detected, $version)) {
                 case -1:
                     // Installed version OLDER than the one being considered, so do not
                     // include any scenarios that only run from the considered version up.
                     if ($direction === 'from') {
-                        $tags[] = '~@app_from' . $version;
+                        $tags[] = '@'.$prefix.'_from' . $version;
                     }
                     break;
 
@@ -800,17 +858,13 @@ class behat_config_util {
                     // Installed version NEWER than the one being considered, so do not
                     // include any scenarios that only run up to that version.
                     if ($direction === 'upto') {
-                        $tags[] = '~@app_upto' . $version;
+                        $tags[] = '@'.$prefix.'_upto' . $version;
                     }
                     break;
             }
         }
 
-        if ($verbose) {
-            mtrace('Configured app tests for version ' . $installedversion);
-        }
-
-        return join(' && ', $tags);
+        return $tags;
     }
 
     /**
@@ -1430,6 +1484,11 @@ class behat_config_util {
         if ((empty($CFG->behat_ionic_dirroot) && empty($CFG->behat_ionic_wwwroot)) ||
                 $theme !== $this->get_default_theme()) {
             $themeblacklisttags[] = '@app';
+        }
+
+        // Check LMS version and add blacklisted tags.
+        if ($lmstags = $this->get_blacklisted_lms_version_tags()) {
+            $themeblacklisttags = array_merge($themeblacklisttags, $lmstags);
         }
 
         // Clean feature key and path.
