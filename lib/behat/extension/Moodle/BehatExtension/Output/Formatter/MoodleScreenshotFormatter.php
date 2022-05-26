@@ -177,6 +177,11 @@ class MoodleScreenshotFormatter implements Formatter {
         if (in_array('html', $formats)) {
             $this->take_contentdump($event, $behathookcontext);
         }
+
+        // Save console content.
+        if (in_array('console', $formats)) {
+            $this->take_consoledump($event, $behathookcontext);
+        }
     }
 
     /**
@@ -249,6 +254,37 @@ class MoodleScreenshotFormatter implements Formatter {
         list ($dir, $filename) = $this->get_faildump_filename($event, 'html');
         $fh = fopen($dir . DIRECTORY_SEPARATOR . $filename, 'w');
         fwrite($fh, $context->getMink()->getSession()->getPage()->getContent());
+        fclose($fh);
+    }
+
+    /**
+     * Take a dump of the browser console content when a step fails.
+     *
+     * @throws Exception
+     * @param AfterStepTested $event
+     * @param \Behat\Context\Context\Context $context
+     */
+    protected function take_consoledump(AfterStepTested $event, $context) {
+        $logs = $this->getSession()->getDriver()->getWebDriver()->manage()->getLog('browser');
+        if (empty($logs)) {
+            return;
+        }
+
+        $dump = "";
+        foreach ($logs as $log) {
+            $time = date('H:i:s', $log['timestamp']);
+            $level = $log['level'];
+            $message = $log['message'];
+            $dump .= "$time - [$level] $message\n";
+        }
+
+        if (empty($dump))  {
+            return;
+        }
+
+        list ($dir, $filename) = $this->get_faildump_filename($event, 'log');
+        $fh = fopen($dir . DIRECTORY_SEPARATOR . $filename, 'w');
+        fwrite($fh, $dump);
         fclose($fh);
     }
 

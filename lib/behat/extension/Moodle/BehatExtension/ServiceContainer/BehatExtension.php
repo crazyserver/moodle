@@ -147,8 +147,8 @@ class BehatExtension implements ExtensionInterface {
         $definition = new Definition('Moodle\BehatExtension\Output\Formatter\MoodleScreenshotFormatter', [
             'moodle_screenshot',
             // phpcs:ignore Generic.Files.LineLength.TooLong
-            'Take screenshot of all steps. Use --format-settings \'{"formats": "html,image"}\' to get specific o/p type',
-            ['formats' => 'html,image'],
+            'Take screenshot of all steps. Use --format-settings \'{"formats": "html,image,console"}\' to get specific o/p type',
+            ['formats' => 'html,image,console'],
             $this->createOutputPrinterDefinition()
         ]);
         $definition->addTag(OutputExtension::FORMATTER_TAG, ['priority' => 102]);
