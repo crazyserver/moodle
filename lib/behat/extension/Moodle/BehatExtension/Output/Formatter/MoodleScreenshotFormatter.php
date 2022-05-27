@@ -22,6 +22,7 @@ use Behat\Behat\EventDispatcher\Event\BeforeScenarioTested;
 use Behat\Behat\EventDispatcher\Event\BeforeStepTested;
 use Behat\Testwork\Output\Formatter;
 use Behat\Testwork\Output\Printer\OutputPrinter;
+use Behat\Context\Context\Context;
 
 // phpcs:disable moodle.NamingConventions.ValidFunctionName.LowercaseMethod
 
@@ -177,6 +178,11 @@ class MoodleScreenshotFormatter implements Formatter {
         if (in_array('html', $formats)) {
             $this->take_contentdump($event, $behathookcontext);
         }
+
+        // Save console content.
+        if (in_array('console', $formats)) {
+            $this->take_consoledump($event, $behathookcontext);
+        }
     }
 
     /**
@@ -227,7 +233,7 @@ class MoodleScreenshotFormatter implements Formatter {
      * @param AfterStepTested $event
      * @param Context $context
      */
-    protected function take_screenshot(AfterStepTested $event, $context) {
+    protected function take_screenshot(AfterStepTested $event, Context $context) {
         // Goutte can't save screenshots.
         if ($context->getMink()->isSessionStarted($context->getMink()->getDefaultSessionName())) {
             if (get_class($context->getMink()->getSession()->getDriver()) === 'Behat\Mink\Driver\GoutteDriver') {
@@ -243,12 +249,43 @@ class MoodleScreenshotFormatter implements Formatter {
      *
      * @throws Exception
      * @param AfterStepTested $event
-     * @param \Behat\Context\Context\Context $context
+     * @param Context $context
      */
-    protected function take_contentdump(AfterStepTested $event, $context) {
+    protected function take_contentdump(AfterStepTested $event, Context $context) {
         list ($dir, $filename) = $this->get_faildump_filename($event, 'html');
         $fh = fopen($dir . DIRECTORY_SEPARATOR . $filename, 'w');
         fwrite($fh, $context->getMink()->getSession()->getPage()->getContent());
+        fclose($fh);
+    }
+
+    /**
+     * Take a dump of the browser console content when a step fails.
+     *
+     * @throws Exception
+     * @param AfterStepTested $event
+     * @param Context $context
+     */
+    protected function take_consoledump(AfterStepTested $event, Context $context) {
+        $logs = $this->getSession()->getDriver()->getWebDriver()->manage()->getLog('browser');
+        if (empty($logs)) {
+            return;
+        }
+
+        $content = "";
+        foreach ($logs as $log) {
+            $time = date('H:i:s', $log['timestamp']);
+            $level = $log['level'];
+            $message = $log['message'];
+            $content .= "$time - [$level] $message\n";
+        }
+
+        if (empty($content)) {
+            return;
+        }
+
+        list ($dir, $filename) = $this->get_faildump_filename($event, 'log');
+        $fh = fopen($dir . DIRECTORY_SEPARATOR . $filename, 'w');
+        fwrite($fh, $content);
         fclose($fh);
     }
 
